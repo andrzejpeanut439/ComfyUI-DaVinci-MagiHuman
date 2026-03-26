@@ -206,9 +206,6 @@ class DaVinciTextEncode:
                 "t5gemma": ("DAVINCI_T5GEMMA", {
                     "tooltip": "T5Gemma encoder from DaVinci T5Gemma Loader node."
                 }),
-                "t5_embeds": ("CONDITIONING", {
-                    "tooltip": "Pre-computed text embeddings from other encoder nodes."
-                }),
             }
         }
 
@@ -217,7 +214,7 @@ class DaVinciTextEncode:
     FUNCTION = "encode"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def encode(self, prompt, max_tokens=640, t5gemma=None, t5_embeds=None):
+    def encode(self, prompt, max_tokens=640, t5gemma=None):
         embed_dim = 3584  # T5Gemma output dimension
 
         if t5gemma is not None:
@@ -252,34 +249,7 @@ class DaVinciTextEncode:
             print(f"[DaVinci] T5Gemma embeddings: {embeds.shape}")
             return ({"embeds": embeds.cpu(), "prompt": prompt},)
 
-        if t5_embeds is not None:
-            # Accept ComfyUI CONDITIONING format: list of [embeds, metadata]
-            if isinstance(t5_embeds, list) and len(t5_embeds) > 0:
-                embeds = t5_embeds[0][0]  # First conditioning, tensor part
-            elif isinstance(t5_embeds, torch.Tensor):
-                embeds = t5_embeds
-            else:
-                raise ValueError(f"Unsupported t5_embeds format: {type(t5_embeds)}")
-
-            # Auto-project if dimension doesn't match (e.g. T5-XXL 4096 -> 3584)
-            if embeds.shape[-1] != embed_dim:
-                print(f"[DaVinci] Projecting text embeddings from {embeds.shape[-1]} to {embed_dim}")
-                embeds = F.linear(embeds, torch.randn(embed_dim, embeds.shape[-1],
-                                  device=embeds.device, dtype=embeds.dtype) * 0.01)
-
-            # Pad or truncate to max_tokens
-            if embeds.dim() == 2:
-                embeds = embeds.unsqueeze(0)
-            if embeds.shape[1] < max_tokens:
-                pad = torch.zeros(embeds.shape[0], max_tokens - embeds.shape[1], embed_dim,
-                                   device=embeds.device, dtype=embeds.dtype)
-                embeds = torch.cat([embeds, pad], dim=1)
-            elif embeds.shape[1] > max_tokens:
-                embeds = embeds[:, :max_tokens]
-
-            return ({"embeds": embeds, "prompt": prompt},)
-
-        # No external encoder: create deterministic prompt-seeded embeddings
+        # No T5Gemma: create deterministic prompt-seeded embeddings
         # This produces unique embeddings per prompt (not random noise)
         print(f"[DaVinci] Generating built-in text embeddings (connect T5 encoder for best quality)")
 
