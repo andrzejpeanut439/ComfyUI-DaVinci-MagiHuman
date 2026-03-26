@@ -52,8 +52,8 @@ class BlockSwapManager:
         self.model.audio_embedder.to(self.device)
         self.model.text_embedder.to(self.device)
         self.model.rope.to(self.device)
-        self.model.final_norm_video.to(self.device)
-        self.model.final_norm_audio.to(self.device)
+        self.model.final_norm_video.data = self.model.final_norm_video.data.to(self.device)
+        self.model.final_norm_audio.data = self.model.final_norm_audio.data.to(self.device)
         self.model.final_linear_video.to(self.device)
         self.model.final_linear_audio.to(self.device)
 

@@ -13,7 +13,7 @@ import folder_paths
 import comfy.model_management as mm
 from comfy.utils import ProgressBar
 
-from .model_dit import DiTModel, load_dit_from_sharded
+from .model_dit import DiTModel, load_dit_from_sharded, _rms_norm
 from .turbo_vae import TurboVAEDecoder, load_turbo_vae
 from .scheduler import FlowMatchingScheduler
 from .data_proxy import MagiDataProxy
@@ -311,26 +311,29 @@ class DaVinciSampler:
         scheduler = FlowMatchingScheduler(shift=shift)
         sigmas = scheduler.get_sigmas(steps, device=device)
 
+        # Keep video and audio tokens separate (different channel dims: 192 vs 64)
+        sv = seq_data["video_shape"][0]
+        sa = seq_data["audio_shape"][0]
+        x_video = video_tokens  # [B, sv, 192]
+        x_audio = seq_data["audio_tokens"]  # [B, sa, 64]
+        x_text = seq_data["text_tokens"]  # [B, st, 3584] - fixed, not denoised
+
         # Handle partial denoising
         if denoise_strength < 1.0:
             start_step = int((1.0 - denoise_strength) * steps)
             sigma_start = sigmas[start_step]
-            noise = torch.randn_like(video_tokens)
-            video_tokens = scheduler.add_noise(video_tokens, noise, sigma_start.item())
-            # Update in sequence
-            sv = seq_data["video_shape"][0]
-            seq_data["video_tokens"] = video_tokens
+            noise_v = torch.randn_like(x_video)
+            x_video = scheduler.add_noise(x_video, noise_v, sigma_start.item())
+            noise_a = torch.randn_like(x_audio)
+            x_audio = scheduler.add_noise(x_audio, noise_a, sigma_start.item())
         else:
             start_step = 0
-            # Scale initial noise by first sigma
-            video_tokens = video_tokens * sigmas[0]
-            seq_data["video_tokens"] = video_tokens
 
-        # Concatenate tokens into single sequence for transformer
-        x = torch.cat([
-            seq_data["video_tokens"],
-            seq_data["audio_tokens"],
-            seq_data["text_tokens"],
+        # Precompute coords and RoPE (constant across steps)
+        coords = torch.cat([
+            seq_data["video_coords"],
+            seq_data["audio_coords"],
+            seq_data["text_coords"],
         ], dim=1)
 
         pbar = ProgressBar(steps - start_step)
@@ -340,53 +343,34 @@ class DaVinciSampler:
             sigma = sigmas[i].item()
             sigma_next = sigmas[i + 1].item()
 
-            def step_callback(layer_idx, total_layers):
-                pass  # Could add per-layer progress here
-
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
-                # Compute RoPE
-                coords = torch.cat([
-                    seq_data["video_coords"],
-                    seq_data["audio_coords"],
-                    seq_data["text_coords"],
-                ], dim=1)
                 rope_cos, rope_sin = dit.rope(coords)
 
-                # Embed inputs
-                sv = seq_data["video_shape"][0]
-                sa = seq_data["audio_shape"][0]
-
-                v_emb = dit.video_embedder(x[:, :sv])
-                a_emb = dit.audio_embedder(x[:, sv:sv + sa])
-                t_emb = dit.text_embedder(x[:, sv + sa:])
-                h = torch.cat([v_emb, a_emb, t_emb], dim=1)
+                # Embed each modality to hidden_size (5120) then concatenate
+                v_emb = dit.video_embedder(x_video)
+                a_emb = dit.audio_embedder(x_audio)
+                t_emb = dit.text_embedder(x_text)
+                h = torch.cat([v_emb, a_emb, t_emb], dim=1)  # [B, S, 5120]
 
                 # Run through transformer with block swapping
                 h = swap_manager.forward_with_swap(
                     h, rope_cos, rope_sin,
                     seq_data["modality_ids"],
-                    callback=step_callback,
                 )
 
-                # Extract predictions
-                video_pred = dit.final_linear_video(dit.final_norm_video(h[:, :sv]))
-                audio_pred = dit.final_linear_audio(dit.final_norm_audio(h[:, sv:sv + sa]))
+                # Extract predictions (project back to modality dims)
+                video_pred = dit.final_linear_video(_rms_norm(h[:, :sv], dit.final_norm_video))
+                audio_pred = dit.final_linear_audio(_rms_norm(h[:, sv:sv + sa], dit.final_norm_audio))
 
             # Scheduler step (DDIM for distill)
-            x_video = x[:, :sv]
-            x_audio = x[:, sv:sv + sa]
-
             x_video = scheduler.step_ddim(video_pred, sigma, sigma_next, x_video)
             x_audio = scheduler.step_ddim(audio_pred, sigma, sigma_next, x_audio)
 
-            # Reassemble sequence
-            x = torch.cat([x_video, x_audio, x[:, sv + sa:]], dim=1)
-
             pbar.update(1)
 
-        # Extract final video latent
-        final_video_tokens = x[:, :sv].cpu()
-        final_audio_tokens = x[:, sv:sv + sa].cpu()
+        # Extract final tokens
+        final_video_tokens = x_video.cpu()
+        final_audio_tokens = x_audio.cpu()
 
         # Unpatchify back to latent volume
         video_latent = proxy.unpatchify_video(final_video_tokens, latent_t, latent_h, latent_w)
@@ -495,11 +479,17 @@ class DaVinciSuperResolution:
         # Scale sigmas to start from the re-noise sigma
         sigmas = sigmas * sigma
 
-        # Concatenate
-        x = torch.cat([
-            seq_data["video_tokens"],
-            seq_data["audio_tokens"],
-            seq_data["text_tokens"],
+        # Keep modalities separate (different channel dims)
+        sv = seq_data["video_shape"][0]
+        sa = seq_data["audio_shape"][0]
+        x_video = video_tokens  # [B, sv, 192]
+        x_audio = audio_tokens  # [B, sa, 64]
+        x_text = text_tokens    # [B, st, 3584]
+
+        coords = torch.cat([
+            seq_data["video_coords"],
+            seq_data["audio_coords"],
+            seq_data["text_coords"],
         ], dim=1)
 
         pbar = ProgressBar(sr_steps)
@@ -509,19 +499,11 @@ class DaVinciSuperResolution:
             sig_next = sigmas[i + 1].item()
 
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
-                coords = torch.cat([
-                    seq_data["video_coords"],
-                    seq_data["audio_coords"],
-                    seq_data["text_coords"],
-                ], dim=1)
                 rope_cos, rope_sin = dit.rope(coords)
 
-                sv = seq_data["video_shape"][0]
-                sa = seq_data["audio_shape"][0]
-
-                v_emb = dit.video_embedder(x[:, :sv])
-                a_emb = dit.audio_embedder(x[:, sv:sv + sa])
-                t_emb = dit.text_embedder(x[:, sv + sa:])
+                v_emb = dit.video_embedder(x_video)
+                a_emb = dit.audio_embedder(x_audio)
+                t_emb = dit.text_embedder(x_text)
                 h = torch.cat([v_emb, a_emb, t_emb], dim=1)
 
                 h = swap_manager.forward_with_swap(
@@ -529,18 +511,17 @@ class DaVinciSuperResolution:
                     seq_data["modality_ids"],
                 )
 
-                video_pred = dit.final_linear_video(dit.final_norm_video(h[:, :sv]))
-                audio_pred = dit.final_linear_audio(dit.final_norm_audio(h[:, sv:sv + sa]))
+                video_pred = dit.final_linear_video(_rms_norm(h[:, :sv], dit.final_norm_video))
+                audio_pred = dit.final_linear_audio(_rms_norm(h[:, sv:sv + sa], dit.final_norm_audio))
 
-            x_video = scheduler.step_ddim(video_pred, sig, sig_next, x[:, :sv])
-            x_audio = scheduler.step_ddim(audio_pred, sig, sig_next, x[:, sv:sv + sa])
-            x = torch.cat([x_video, x_audio, x[:, sv + sa:]], dim=1)
+            x_video = scheduler.step_ddim(video_pred, sig, sig_next, x_video)
+            x_audio = scheduler.step_ddim(audio_pred, sig, sig_next, x_audio)
 
             pbar.update(1)
 
         # Unpatchify
-        final_video_tokens = x[:, :sv].cpu()
-        final_audio_tokens = x[:, sv:sv + sa].cpu()
+        final_video_tokens = x_video.cpu()
+        final_audio_tokens = x_audio.cpu()
         video_latent_sr = proxy.unpatchify_video(final_video_tokens, sr_t, sr_h, sr_w)
 
         if force_offload:
