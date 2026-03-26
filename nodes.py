@@ -139,13 +139,56 @@ class DaVinciTurboVAELoader:
         return ({"vae": vae, "dtype": torch_dtype},)
 
 
+class DaVinciT5GemmaLoader:
+    """Load the T5Gemma-9B text encoder for daVinci-MagiHuman.
+
+    Downloads google/t5gemma-9b-9b-ul2 from HuggingFace (~18GB in bf16).
+    The encoder is offloaded to CPU after encoding to free VRAM.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
+            },
+        }
+
+    RETURN_TYPES = ("DAVINCI_T5GEMMA",)
+    RETURN_NAMES = ("t5gemma",)
+    FUNCTION = "load"
+    CATEGORY = "DaVinci-MagiHuman"
+
+    def load(self, dtype="bf16"):
+        from transformers import AutoTokenizer
+        from transformers.models.t5gemma import T5GemmaEncoderModel
+
+        dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+        torch_dtype = dtype_map[dtype]
+
+        model_id = "google/t5gemma-9b-9b-ul2"
+        print(f"[DaVinci] Loading T5Gemma from {model_id} ({dtype})...")
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = T5GemmaEncoderModel.from_pretrained(
+            model_id,
+            is_encoder_decoder=False,
+            dtype=torch_dtype,
+        )
+        # Keep on CPU until needed
+        model = model.to("cpu")
+        model.eval()
+
+        print(f"[DaVinci] T5Gemma loaded.")
+
+        return ({"model": model, "tokenizer": tokenizer, "dtype": torch_dtype},)
+
+
 class DaVinciTextEncode:
     """Encode text prompt for daVinci-MagiHuman.
 
-    Uses a lightweight T5 tokenizer + embedding approach.
-    For best quality, provide pre-computed T5Gemma embeddings via the optional input.
-    Without external embeddings, uses a simple bag-of-words encoding seeded by the prompt
-    to produce deterministic, prompt-sensitive embeddings.
+    Connect the DaVinci T5Gemma Loader for proper text conditioning.
+    Without it, uses placeholder embeddings (won't produce meaningful video).
     """
 
     @classmethod
@@ -160,8 +203,11 @@ class DaVinciTextEncode:
                 "max_tokens": ("INT", {"default": 640, "min": 64, "max": 1024, "step": 64}),
             },
             "optional": {
+                "t5gemma": ("DAVINCI_T5GEMMA", {
+                    "tooltip": "T5Gemma encoder from DaVinci T5Gemma Loader node."
+                }),
                 "t5_embeds": ("CONDITIONING", {
-                    "tooltip": "Pre-computed text embeddings. If 4096-dim (T5-XXL), auto-projected to 3584."
+                    "tooltip": "Pre-computed text embeddings from other encoder nodes."
                 }),
             }
         }
@@ -171,8 +217,40 @@ class DaVinciTextEncode:
     FUNCTION = "encode"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def encode(self, prompt, max_tokens=640, t5_embeds=None):
+    def encode(self, prompt, max_tokens=640, t5gemma=None, t5_embeds=None):
         embed_dim = 3584  # T5Gemma output dimension
+
+        if t5gemma is not None:
+            # Use the dedicated T5Gemma encoder
+            model = t5gemma["model"]
+            tokenizer = t5gemma["tokenizer"]
+            torch_dtype = t5gemma["dtype"]
+
+            print(f"[DaVinci] Encoding prompt with T5Gemma: {prompt[:80]}...")
+
+            # Move to GPU for encoding
+            model = model.to(device)
+
+            with torch.no_grad():
+                inputs = tokenizer([prompt], return_tensors="pt").to(device)
+                outputs = model(**inputs)
+                embeds = outputs["last_hidden_state"].float()  # [1, seq_len, 3584]
+
+            # Move back to CPU to free VRAM
+            model.to("cpu")
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            # Pad or truncate to max_tokens
+            if embeds.shape[1] < max_tokens:
+                pad = torch.zeros(1, max_tokens - embeds.shape[1], embed_dim,
+                                   device=embeds.device, dtype=embeds.dtype)
+                embeds = torch.cat([embeds, pad], dim=1)
+            elif embeds.shape[1] > max_tokens:
+                embeds = embeds[:, :max_tokens]
+
+            print(f"[DaVinci] T5Gemma embeddings: {embeds.shape}")
+            return ({"embeds": embeds.cpu(), "prompt": prompt},)
 
         if t5_embeds is not None:
             # Accept ComfyUI CONDITIONING format: list of [embeds, metadata]
@@ -681,6 +759,7 @@ class DaVinciVideoOutput:
 NODE_CLASS_MAPPINGS = {
     "DaVinciModelLoader": DaVinciModelLoader,
     "DaVinciTurboVAELoader": DaVinciTurboVAELoader,
+    "DaVinciT5GemmaLoader": DaVinciT5GemmaLoader,
     "DaVinciTextEncode": DaVinciTextEncode,
     "DaVinciSampler": DaVinciSampler,
     "DaVinciSuperResolution": DaVinciSuperResolution,
@@ -691,6 +770,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DaVinciModelLoader": "DaVinci Model Loader",
     "DaVinciTurboVAELoader": "DaVinci TurboVAE Loader",
+    "DaVinciT5GemmaLoader": "DaVinci T5Gemma Loader",
     "DaVinciTextEncode": "DaVinci Text Encode",
     "DaVinciSampler": "DaVinci Sampler",
     "DaVinciSuperResolution": "DaVinci Super Resolution",
