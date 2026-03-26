@@ -657,6 +657,9 @@ class DaVinciVideoOutput:
                 "filename_prefix": ("STRING", {"default": "davinci"}),
                 "format": (["mp4", "webm"], {"default": "mp4"}),
             },
+            "optional": {
+                "audio": ("AUDIO", {"tooltip": "Audio from DaVinci Audio Decode node."}),
+            }
         }
 
     RETURN_TYPES = ()
@@ -664,9 +667,9 @@ class DaVinciVideoOutput:
     FUNCTION = "save"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def save(self, frames, fps, filename_prefix, format="mp4"):
+    def save(self, frames, fps, filename_prefix, format="mp4", audio=None):
         import subprocess
-        import tempfile
+        import soundfile as sf
 
         output_dir = folder_paths.get_output_directory()
         full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
@@ -680,7 +683,6 @@ class DaVinciVideoOutput:
 
         print(f"[DaVinci] Saving {T} frames ({W}x{H}) at {fps}fps to {output_path}")
 
-        # Use ffmpeg to encode
         if format == "mp4":
             codec = "libx264"
             pix_fmt = "yuv420p"
@@ -688,43 +690,193 @@ class DaVinciVideoOutput:
             codec = "libvpx-vp9"
             pix_fmt = "yuv420p"
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-s", f"{W}x{H}",
-            "-pix_fmt", "rgb24",
-            "-r", str(fps),
-            "-i", "-",
-            "-c:v", codec,
-            "-pix_fmt", pix_fmt,
-            "-crf", "18",
-            output_path,
-        ]
+        # If audio provided, save audio to temp file then mux
+        audio_tmp = None
+        if audio is not None and "waveform" in audio:
+            waveform = audio["waveform"]
+            sample_rate = audio["sample_rate"]
+            if waveform.numel() > 1:
+                audio_tmp = os.path.join(full_output_folder, f"{filename}_{counter:05d}_audio.wav")
+                # [B, channels, samples] -> [samples, channels]
+                wav_np = waveform[0].permute(1, 0).numpy()
+                sf.write(audio_tmp, wav_np, sample_rate)
+                print(f"[DaVinci] Audio saved to temp: {audio_tmp}")
 
         try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            if audio_tmp:
+                # Video + audio mux
+                video_tmp = os.path.join(full_output_folder, f"{filename}_{counter:05d}_video_tmp.{format}")
+                # First encode video
+                cmd_video = [
+                    "ffmpeg", "-y",
+                    "-f", "rawvideo", "-vcodec", "rawvideo",
+                    "-s", f"{W}x{H}", "-pix_fmt", "rgb24", "-r", str(fps),
+                    "-i", "-",
+                    "-c:v", codec, "-pix_fmt", pix_fmt, "-crf", "18",
+                    video_tmp,
+                ]
+                proc = subprocess.Popen(cmd_video, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                pbar = ProgressBar(T)
+                for i in range(T):
+                    frame = (frames[i].numpy() * 255).astype(np.uint8)
+                    proc.stdin.write(frame.tobytes())
+                    pbar.update(1)
+                proc.stdin.close()
+                proc.wait()
 
-            # Write frames
-            pbar = ProgressBar(T)
-            for i in range(T):
-                frame = (frames[i].numpy() * 255).astype(np.uint8)
-                proc.stdin.write(frame.tobytes())
-                pbar.update(1)
-
-            proc.stdin.close()
-            proc.wait()
-
-            if proc.returncode != 0:
-                stderr = proc.stderr.read().decode()
-                print(f"[DaVinci] FFmpeg error: {stderr}")
+                # Mux video + audio
+                cmd_mux = [
+                    "ffmpeg", "-y",
+                    "-i", video_tmp, "-i", audio_tmp,
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-shortest", output_path,
+                ]
+                subprocess.run(cmd_mux, stderr=subprocess.PIPE)
+                # Cleanup temps
+                os.remove(video_tmp)
+                os.remove(audio_tmp)
+                print(f"[DaVinci] Video+audio saved: {output_path}")
             else:
-                print(f"[DaVinci] Video saved: {output_path}")
+                # Video only
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "rawvideo", "-vcodec", "rawvideo",
+                    "-s", f"{W}x{H}", "-pix_fmt", "rgb24", "-r", str(fps),
+                    "-i", "-",
+                    "-c:v", codec, "-pix_fmt", pix_fmt, "-crf", "18",
+                    output_path,
+                ]
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                pbar = ProgressBar(T)
+                for i in range(T):
+                    frame = (frames[i].numpy() * 255).astype(np.uint8)
+                    proc.stdin.write(frame.tobytes())
+                    pbar.update(1)
+                proc.stdin.close()
+                proc.wait()
+
+                if proc.returncode != 0:
+                    stderr = proc.stderr.read().decode()
+                    print(f"[DaVinci] FFmpeg error: {stderr}")
+                else:
+                    print(f"[DaVinci] Video saved: {output_path}")
         except FileNotFoundError:
             print("[DaVinci] ERROR: ffmpeg not found. Install ffmpeg to save videos.")
 
         return {"ui": {"videos": [{"filename": f"{filename}_{counter:05d}.{format}",
                                     "subfolder": subfolder, "type": "output"}]}}
+
+
+class DaVinciAudioVAELoader:
+    """Load Stable Audio Open 1.0 VAE for audio decoding."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {},
+        }
+
+    RETURN_TYPES = ("DAVINCI_AUDIO_VAE",)
+    RETURN_NAMES = ("audio_vae",)
+    FUNCTION = "load"
+    CATEGORY = "DaVinci-MagiHuman"
+
+    def load(self):
+        import sys
+        # Add reference code to path for sa_audio_module
+        ref_path = os.path.join(os.path.dirname(__file__), "davinci_ref", "inference", "model", "sa_audio")
+        if ref_path not in sys.path:
+            sys.path.insert(0, ref_path)
+        from sa_audio_module import create_model_from_config
+
+        model_id = "stabilityai/stable-audio-open-1.0"
+        cache_dir = os.path.join(folder_paths.models_dir, "stable_audio")
+
+        print(f"[DaVinci] Loading Stable Audio VAE from {model_id}...")
+
+        # Download model files
+        from huggingface_hub import hf_hub_download
+        config_path = hf_hub_download(model_id, "model_config.json", cache_dir=cache_dir)
+        weights_path = hf_hub_download(model_id, "model.safetensors", cache_dir=cache_dir)
+
+        # Load config and build VAE only
+        with open(config_path) as f:
+            full_config = json.load(f)
+
+        vae_config = full_config["model"]["pretransform"]["config"]
+        sample_rate = full_config["sample_rate"]
+
+        autoencoder_config = {
+            "model_type": "autoencoder",
+            "sample_rate": sample_rate,
+            "model": vae_config,
+        }
+
+        vae_model = create_model_from_config(autoencoder_config)
+
+        # Load only VAE weights from full checkpoint
+        from safetensors.torch import load_file
+        full_sd = load_file(weights_path, device="cpu")
+        vae_sd = {}
+        for key, value in full_sd.items():
+            if key.startswith("pretransform.model."):
+                vae_sd[key[len("pretransform.model."):]] = value
+        del full_sd
+
+        vae_model.load_state_dict(vae_sd)
+        vae_model.eval()
+
+        print(f"[DaVinci] Stable Audio VAE loaded (sample_rate={sample_rate}).")
+
+        return ({"vae": vae_model, "sample_rate": sample_rate},)
+
+
+class DaVinciAudioDecode:
+    """Decode audio latents to waveform using Stable Audio VAE."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio_vae": ("DAVINCI_AUDIO_VAE",),
+                "latent": ("DAVINCI_LATENT",),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "decode"
+    CATEGORY = "DaVinci-MagiHuman"
+
+    def decode(self, audio_vae, latent):
+        vae = audio_vae["vae"]
+        sample_rate = audio_vae["sample_rate"]
+
+        audio_tokens = latent["audio_tokens"]  # [B, num_frames, 64]
+        if audio_tokens is None:
+            print("[DaVinci] No audio tokens to decode.")
+            return ({"waveform": torch.zeros(1, 1, 1), "sample_rate": sample_rate},)
+
+        print(f"[DaVinci] Decoding audio latents {audio_tokens.shape}...")
+
+        # Audio latent: [B, T, 64] -> [B, 64, T] for 1D conv decoder
+        audio_latent = audio_tokens.float().permute(0, 2, 1)
+
+        vae = vae.to(device)
+
+        with torch.no_grad():
+            waveform = vae.decode(audio_latent.to(device))  # [B, channels, samples]
+
+        vae.to(offload_device)
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        waveform = waveform.cpu().float()
+        print(f"[DaVinci] Audio decoded: {waveform.shape}, sample_rate={sample_rate}")
+
+        # ComfyUI AUDIO format: dict with waveform [B, channels, samples] and sample_rate
+        return ({"waveform": waveform, "sample_rate": sample_rate},)
 
 
 # Node registration
@@ -736,6 +888,8 @@ NODE_CLASS_MAPPINGS = {
     "DaVinciSampler": DaVinciSampler,
     "DaVinciSuperResolution": DaVinciSuperResolution,
     "DaVinciDecode": DaVinciDecode,
+    "DaVinciAudioVAELoader": DaVinciAudioVAELoader,
+    "DaVinciAudioDecode": DaVinciAudioDecode,
     "DaVinciVideoOutput": DaVinciVideoOutput,
 }
 
@@ -747,5 +901,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DaVinciSampler": "DaVinci Sampler",
     "DaVinciSuperResolution": "DaVinci Super Resolution",
     "DaVinciDecode": "DaVinci Decode (TurboVAE)",
+    "DaVinciAudioVAELoader": "DaVinci Audio VAE Loader",
+    "DaVinciAudioDecode": "DaVinci Audio Decode",
     "DaVinciVideoOutput": "DaVinci Video Output",
 }
