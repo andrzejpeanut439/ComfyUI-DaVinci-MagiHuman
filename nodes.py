@@ -490,6 +490,9 @@ class DaVinciSuperResolution:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "force_offload": ("BOOLEAN", {"default": True}),
             },
+            "optional": {
+                "ref_image": ("IMAGE", {"tooltip": "Same reference image used for base generation. Re-encoded at SR resolution."}),
+            },
         }
 
     RETURN_TYPES = ("DAVINCI_LATENT",)
@@ -498,10 +501,22 @@ class DaVinciSuperResolution:
     CATEGORY = "DaVinci-MagiHuman"
 
     def upscale(self, sr_model, latent, text_embeds, target_width, target_height,
-                sr_steps, noise_value, shift, seed, force_offload=True):
+                sr_steps, noise_value, shift, seed, force_offload=True, ref_image=None):
         dit = sr_model["model"]
         swap_manager = sr_model["swap_manager"]
         dtype = sr_model["dtype"]
+
+        # Encode ref image at SR resolution if provided
+        sr_latent_image = None
+        if ref_image is not None:
+            img = ref_image[0:1]
+            # Resize to SR target dimensions
+            if img.shape[1] != target_height or img.shape[2] != target_width:
+                img_t = img.permute(0, 3, 1, 2)
+                img_t = F.interpolate(img_t, size=(target_height, target_width), mode='bilinear', align_corners=False)
+                img = img_t.permute(0, 2, 3, 1)
+            sr_latent_image = _encode_ref_image(img, target_height, target_width, device, dtype)
+            print(f"[DaVinci SR] Encoded SR ref image: {sr_latent_image.shape}")
 
         embeds = text_embeds["embeds"]
         text_len = max(1, (embeds.abs().sum(-1) > 0).sum(-1).item())
@@ -527,6 +542,7 @@ class DaVinciSuperResolution:
             noise_value=noise_value,
             shift=shift,
             seed=seed,
+            latent_image=sr_latent_image,
             device=device,
             dtype=dtype,
             callback=step_callback,
