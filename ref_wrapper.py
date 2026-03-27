@@ -305,3 +305,203 @@ def run_distill_sampling(
         "height": height,
         "num_frames": num_frames,
     }
+
+
+def create_sr_data_proxy() -> MagiDataProxy:
+    """Create a MagiDataProxy with SR-specific config (coords_style=v1)."""
+    import copy
+    dp_config = DataProxyConfig()
+    dp_config.coords_style = "v1"
+    return MagiDataProxy(config=dp_config)
+
+
+def _build_renoise_sigmas():
+    """Build the ZeroSNRDDPM sigma schedule used for SR re-noising (matching reference)."""
+    import numpy as np
+    from functools import partial
+    linear_start = 0.00085
+    linear_end = 0.0120
+    num_timesteps = 1000
+    betas = torch.linspace(linear_start**0.5, linear_end**0.5, num_timesteps, dtype=torch.float64) ** 2
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    sigmas = (1 - alphas_cumprod) / alphas_cumprod
+    sigmas = sigmas.sqrt().float()
+    # Reference uses flip=True: reversed so index 0 = most noise, 999 = least
+    sigmas = sigmas.flip(0)
+    return sigmas
+
+
+def run_sr_sampling(
+    sr_model: DiTModel,
+    swap_manager: RefBlockSwapManager,
+    sr_data_proxy: MagiDataProxy,
+    text_embeds: torch.Tensor,
+    text_len: int,
+    br_latent_video: torch.Tensor,
+    br_latent_audio: torch.Tensor,
+    sr_width: int = 1920,
+    sr_height: int = 1088,
+    num_frames: int = 126,
+    sr_steps: int = 5,
+    noise_value: int = 220,
+    shift: float = 5.0,
+    seed: int = 0,
+    sr_audio_noise_scale: float = 0.7,
+    device: torch.device = None,
+    dtype: torch.dtype = torch.bfloat16,
+    callback: Optional[Callable] = None,
+    latent_image: Optional[torch.Tensor] = None,
+) -> dict:
+    """Run SR sampling using reference components.
+
+    Matches reference: interpolate base latent to SR size, re-noise,
+    run SR model for sr_steps using UniPC step (not step_ddim).
+    Audio is NOT updated during SR.
+    """
+    if device is None:
+        device = torch.device("cuda")
+
+    torch.manual_seed(seed)
+
+    eval_config = EvaluationConfig()
+    vae_stride = eval_config.vae_stride
+    patch_size = eval_config.patch_size
+
+    # Compute SR latent dims
+    sr_latent_h = sr_height // vae_stride[1] // patch_size[1] * patch_size[1]
+    sr_latent_w = sr_width // vae_stride[2] // patch_size[2] * patch_size[2]
+    sr_latent_t = br_latent_video.shape[2]  # same temporal length
+
+    print(f"[SR] Upscaling to {sr_width}x{sr_height}, latent={sr_latent_t}x{sr_latent_h}x{sr_latent_w}, steps={sr_steps}")
+
+    # Trilinear interpolation of base latent to SR size (matching reference)
+    latent_video = torch.nn.functional.interpolate(
+        br_latent_video.to(device=device, dtype=torch.float32),
+        size=(sr_latent_t, sr_latent_h, sr_latent_w),
+        mode="trilinear",
+        align_corners=True,
+    )
+
+    # Re-noise using ZeroSNRDDPM sigmas (matching reference exactly)
+    if noise_value != 0:
+        renoise_sigmas = _build_renoise_sigmas().to(device)
+        sigma = renoise_sigmas[noise_value]
+        noise = torch.randn_like(latent_video)
+        latent_video = latent_video * sigma + noise * (1 - sigma**2) ** 0.5
+        print(f"[SR] Re-noised at noise_value={noise_value}, sigma={sigma:.4f}")
+
+    # Audio: partially re-noise (matching reference)
+    latent_audio = br_latent_audio.to(device=device, dtype=torch.float32)
+    audio_noise = torch.randn_like(latent_audio)
+    latent_audio_sr = audio_noise * sr_audio_noise_scale + latent_audio * (1 - sr_audio_noise_scale)
+
+    # I2V image for SR (if provided)
+    if latent_image is not None:
+        latent_image = latent_image.to(device=device, dtype=torch.float32)
+
+    # Schedulers
+    video_scheduler = FlowUniPCMultistepScheduler()
+    audio_scheduler = FlowUniPCMultistepScheduler()
+    video_scheduler.set_timesteps(sr_steps, device="cpu", shift=shift)
+    audio_scheduler.set_timesteps(sr_steps, device="cpu", shift=shift)
+    timesteps = video_scheduler.timesteps
+
+    # SR denoising loop
+    for idx, t in enumerate(timesteps):
+        # I2V: overwrite first frame
+        if latent_image is not None:
+            latent_video[:, :, :1] = latent_image[:, :, :1]
+
+        eval_input = EvalInput(
+            x_t=latent_video,
+            audio_x_t=latent_audio_sr,
+            audio_feat_len=[latent_audio_sr.shape[1]],
+            txt_feat=text_embeds.to(device=device, dtype=dtype),
+            txt_feat_len=[text_len],
+        )
+
+        with torch.no_grad():
+            packed = sr_data_proxy.process_input(eval_input)
+            x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler = packed
+
+            x = x.to(device=device, dtype=dtype)
+            coords_mapping = coords_mapping.to(device=device)
+
+            swap_manager._evict_all()
+
+            from inference.model.dit.dit_module import ModalityDispatcher
+            modality_dispatcher = ModalityDispatcher(modality_mapping, 3)
+            permute_mapping = modality_dispatcher.permute_mapping
+            inv_permute_mapping = modality_dispatcher.inv_permute_mapping
+            video_mask = modality_mapping == Modality.VIDEO
+            audio_mask = modality_mapping == Modality.AUDIO
+            text_mask = modality_mapping == Modality.TEXT
+
+            x, rope = sr_model.adapter(x, coords_mapping, video_mask, audio_mask, text_mask)
+            x = x.to(dtype)
+            x = ModalityDispatcher.permute(x, permute_mapping)
+
+            cp_split_sizes = [x.shape[0]]
+
+            for layer_idx in range(swap_manager.num_layers):
+                swap_manager._move_to_gpu(layer_idx)
+                if layer_idx + 1 < swap_manager.num_layers:
+                    swap_manager._move_to_gpu(layer_idx + 1)
+
+                x = sr_model.block.layers[layer_idx](
+                    x, rope,
+                    permute_mapping=permute_mapping,
+                    inv_permute_mapping=inv_permute_mapping,
+                    varlen_handler=varlen_handler,
+                    local_attn_handler=local_attn_handler,
+                    modality_dispatcher=modality_dispatcher,
+                    cp_split_sizes=cp_split_sizes,
+                )
+
+                evict = layer_idx - swap_manager.blocks_on_gpu + 1
+                if evict >= 0:
+                    swap_manager._move_to_cpu(evict)
+
+            x = ModalityDispatcher.inv_permute(x, inv_permute_mapping)
+
+            x_video = x[video_mask].float()
+            x_video = sr_model.final_norm_video(x_video)
+            x_video = sr_model.final_linear_video.float()(x_video)
+
+            x_audio = x[audio_mask].float()
+            x_audio = sr_model.final_norm_audio(x_audio)
+            x_audio = sr_model.final_linear_audio.float()(x_audio)
+
+            sr_model.final_linear_video.to(dtype)
+            sr_model.final_linear_audio.to(dtype)
+
+            x_out = torch.zeros(
+                x.shape[0],
+                max(sr_model.config.video_in_channels, sr_model.config.audio_in_channels),
+                device=x.device, dtype=torch.float32,
+            )
+            x_out[video_mask, :sr_model.config.video_in_channels] = x_video
+            x_out[audio_mask, :sr_model.config.audio_in_channels] = x_audio
+
+            v_video, v_audio = sr_data_proxy.process_output(x_out)
+
+        # SR uses UniPC step (not step_ddim), audio NOT updated
+        latent_video = video_scheduler.step(v_video, t, latent_video, return_dict=False)[0]
+
+        if callback:
+            callback(idx, sr_steps, latent_video, latent_audio)
+
+    # Final I2V overwrite
+    if latent_image is not None:
+        latent_video[:, :, :1] = latent_image[:, :, :1]
+
+    print(f"[SR] Done. latent_video={latent_video.shape}")
+
+    return {
+        "video_latent": latent_video.cpu(),
+        "audio_tokens": latent_audio.cpu(),  # original audio, not SR'd
+        "width": sr_width,
+        "height": sr_height,
+        "num_frames": num_frames,
+    }

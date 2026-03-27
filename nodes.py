@@ -14,8 +14,8 @@ import comfy.model_management as mm
 from comfy.utils import ProgressBar
 
 from .ref_wrapper import (
-    load_ref_model, RefBlockSwapManager, create_data_proxy,
-    run_distill_sampling, EvalInput,
+    load_ref_model, RefBlockSwapManager, create_data_proxy, create_sr_data_proxy,
+    run_distill_sampling, run_sr_sampling, EvalInput,
 )
 # Use reference TurboVAE implementation
 import sys as _sys
@@ -429,7 +429,7 @@ class DaVinciSampler:
 
 
 class DaVinciSuperResolution:
-    """Upscale 256p latent to 1080p using the SR model."""
+    """Upscale 256p latent to 1080p using the SR model (reference pipeline)."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -460,100 +460,34 @@ class DaVinciSuperResolution:
         swap_manager = sr_model["swap_manager"]
         dtype = sr_model["dtype"]
 
-        torch.manual_seed(seed)
+        embeds = text_embeds["embeds"]
+        text_len = max(1, (embeds.abs().sum(-1) > 0).sum(-1).item())
 
-        proxy = MagiDataProxy()
-        scheduler = FlowMatchingScheduler(shift=shift)
-
-        video_latent = latent["video_latent"].to(dtype=dtype)
-        num_frames = latent["num_frames"]
-
-        # Compute target latent dimensions
-        _, _, sr_t, sr_h, sr_w = proxy.get_latent_shape(target_height, target_width, num_frames)
-
-        print(f"[DaVinci SR] Upscaling to {target_width}x{target_height}, "
-              f"SR latent: {sr_t}x{sr_h}x{sr_w}")
-
-        # Trilinear interpolation of base latent to SR size
-        sr_latent = F.interpolate(
-            video_latent.float(),
-            size=(sr_t, sr_h, sr_w),
-            mode='trilinear',
-            align_corners=False,
-        ).to(dtype)
-
-        # Re-noise the interpolated latent
-        sigma = scheduler.get_noise_level_sigma(noise_value)
-        noise = torch.randn_like(sr_latent)
-        sr_latent = scheduler.add_noise(sr_latent, noise, sigma)
-
-        # Patchify
-        video_tokens, video_coords = proxy.patchify_video(sr_latent.to(device))
-
-        # Audio (re-noise audio too)
-        audio_tokens = latent["audio_tokens"].to(device=device, dtype=dtype)
-        audio_noise = torch.randn_like(audio_tokens)
-        sr_audio_noise_scale = 0.7
-        audio_tokens = audio_noise * sr_audio_noise_scale + audio_tokens * (1 - sr_audio_noise_scale)
-        audio_coords = torch.zeros(1, audio_tokens.shape[1], 3, device=device, dtype=dtype)
-        for i in range(audio_tokens.shape[1]):
-            audio_coords[:, i, 0] = i
-
-        # Text
-        text_tokens = text_embeds["embeds"].to(device=device, dtype=dtype)
-        text_coords = proxy.prepare_text_coords(text_tokens)
-
-        # Build sequence
-        seq_data = proxy.build_sequence(
-            video_tokens, video_coords,
-            audio_tokens, audio_coords,
-            text_tokens, text_coords,
-        )
-
-        # SR scheduler
-        scheduler.set_timesteps(sr_steps)
-
-        # Keep modalities separate (different channel dims)
-        sv = seq_data["video_shape"][0]
-        sa = seq_data["audio_shape"][0]
-        x_video = video_tokens  # [B, sv, 192]
-        x_audio = audio_tokens  # [B, sa, 64]
-        x_text = text_tokens    # [B, st, 3584]
-
-        coords = torch.cat([
-            seq_data["video_coords"],
-            seq_data["audio_coords"],
-            seq_data["text_coords"],
-        ], dim=1)
-
+        sr_data_proxy = create_sr_data_proxy()
         pbar = ProgressBar(sr_steps)
 
-        for i in range(sr_steps):
-            with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
-                rope_cos, rope_sin = dit.rope(coords)
+        def step_callback(idx, total, latent_video, latent_audio):
+            pbar.update_absolute(idx + 1, total)
 
-                v_emb = dit.video_embedder(x_video)
-                a_emb = dit.audio_embedder(x_audio)
-                t_emb = dit.text_embedder(x_text)
-                h = torch.cat([v_emb, a_emb, t_emb], dim=1)
-
-                h = swap_manager.forward_with_swap(
-                    h, rope_cos, rope_sin,
-                    seq_data["modality_ids"],
-                )
-
-                video_vel = dit.final_linear_video(_rms_norm(h[:, :sv], dit.final_norm_video))
-                audio_vel = dit.final_linear_audio(_rms_norm(h[:, sv:sv + sa], dit.final_norm_audio))
-
-            x_video = scheduler.step_ddim(video_vel, i, x_video)
-            x_audio = scheduler.step_ddim(audio_vel, i, x_audio)
-
-            pbar.update(1)
-
-        # Unpatchify
-        final_video_tokens = x_video.cpu()
-        final_audio_tokens = x_audio.cpu()
-        video_latent_sr = proxy.unpatchify_video(final_video_tokens, sr_t, sr_h, sr_w)
+        result = run_sr_sampling(
+            sr_model=dit,
+            swap_manager=swap_manager,
+            sr_data_proxy=sr_data_proxy,
+            text_embeds=embeds,
+            text_len=text_len,
+            br_latent_video=latent["video_latent"],
+            br_latent_audio=latent["audio_tokens"],
+            sr_width=target_width,
+            sr_height=target_height,
+            num_frames=latent["num_frames"],
+            sr_steps=sr_steps,
+            noise_value=noise_value,
+            shift=shift,
+            seed=seed,
+            device=device,
+            dtype=dtype,
+            callback=step_callback,
+        )
 
         if force_offload:
             swap_manager.cleanup()
@@ -561,15 +495,7 @@ class DaVinciSuperResolution:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        print(f"[DaVinci SR] Done. Output latent: {video_latent_sr.shape}")
-
-        return ({
-            "video_latent": video_latent_sr,
-            "audio_tokens": final_audio_tokens,
-            "width": target_width,
-            "height": target_height,
-            "num_frames": num_frames,
-        },)
+        return (result,)
 
 
 class DaVinciDecode:
