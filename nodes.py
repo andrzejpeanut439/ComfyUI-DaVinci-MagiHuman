@@ -31,6 +31,59 @@ DAVINCI_MODELS_DIR = os.path.join(folder_paths.models_dir, "daVinci-MagiHuman")
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
 
+# Cached Wan2.2 VAE for image encoding (loaded on first use)
+_wan22_vae_cache = None
+
+
+def _get_wan22_vae(device_target, dtype):
+    """Load the Wan2.2 VAE (z_dim=48) for encoding reference images."""
+    global _wan22_vae_cache
+    if _wan22_vae_cache is not None:
+        return _wan22_vae_cache
+
+    from inference.model.vae2_2.vae2_2_model import get_vae2_2
+
+    # Download Wan2.2 VAE from HuggingFace
+    vae_model_id = "Wan-AI/Wan2.2-T2V-14B"
+    cache_dir = os.path.join(folder_paths.models_dir, "wan_vae")
+
+    from huggingface_hub import hf_hub_download
+    print(f"[DaVinci] Downloading Wan2.2 VAE...")
+    vae_path = hf_hub_download(vae_model_id, "Wan2.2_VAE.pth", cache_dir=cache_dir)
+
+    print(f"[DaVinci] Loading Wan2.2 VAE from {vae_path}...")
+    vae = get_vae2_2(vae_path, device="cpu", weight_dtype=dtype)
+    _wan22_vae_cache = vae
+    print(f"[DaVinci] Wan2.2 VAE loaded (z_dim=48).")
+    return vae
+
+
+def _encode_ref_image(img, height, width, device_target, dtype):
+    """Encode a reference image using Wan2.2 VAE (z_dim=48).
+
+    Args:
+        img: [1, H, W, 3] float32 0-1
+
+    Returns:
+        [1, 48, 1, latH, latW] float32 latent
+    """
+    vae = _get_wan22_vae(device_target, dtype)
+    vae.vae.to(device_target)
+
+    # Convert [1, H, W, 3] 0-1 -> [1, 3, 1, H, W] -1..1
+    x = img.permute(0, 3, 1, 2)  # [1, 3, H, W]
+    x = x * 2.0 - 1.0  # normalize to [-1, 1]
+    x = x.unsqueeze(2)  # [1, 3, 1, H, W]
+    x = x.to(device=device_target, dtype=dtype)
+
+    with torch.no_grad():
+        latent = vae.encode(x)  # [1, 48, 1, latH, latW]
+
+    vae.vae.to("cpu")
+    torch.cuda.empty_cache()
+
+    return latent.to(torch.float32)
+
 
 class DaVinciModelLoader:
     """Load daVinci-MagiHuman DiT model with VRAM-optimized block swapping."""
@@ -318,8 +371,7 @@ class DaVinciSampler:
             },
             "optional": {
                 "turbo_vae": ("DAVINCI_VAE", {"tooltip": "Connect TurboVAE for real-time decoded preview during sampling."}),
-                "ref_image": ("IMAGE", {"tooltip": "Reference image for I2V. First frame will match this image."}),
-                "vae": ("VAE", {"tooltip": "ComfyUI VAE (Wan2.2) to encode reference image. Required for I2V."}),
+                "ref_image": ("IMAGE", {"tooltip": "Reference image for I2V (must be resized to width x height before connecting)."}),
             }
         }
 
@@ -330,15 +382,15 @@ class DaVinciSampler:
 
     def sample(
         self, model, text_embeds, width, height, num_frames, steps, shift, seed,
-        force_offload=True, turbo_vae=None, ref_image=None, vae=None,
+        force_offload=True, turbo_vae=None, ref_image=None,
     ):
         dit = model["model"]
         swap_manager = model["swap_manager"]
         dtype = model["dtype"]
 
-        # Encode reference image if provided
+        # Encode reference image using Wan2.2 VAE (z_dim=48)
         latent_image = None
-        if ref_image is not None and vae is not None:
+        if ref_image is not None:
             print(f"[DaVinci] Encoding reference image {ref_image.shape}...")
             img = ref_image[0:1]  # [1, H, W, 3]
             if img.shape[1] != height or img.shape[2] != width:
@@ -347,18 +399,8 @@ class DaVinciSampler:
                     f"target video size ({width}x{height}). "
                     f"Use a Resize/Crop node to match dimensions before connecting."
                 )
-            # ComfyUI VAE.encode expects [B, H, W, C] float32 0-1
-            latent_image = vae.encode(img)
-            print(f"[DaVinci] Raw VAE output: {latent_image.shape}")
-            # ComfyUI Wan2.2 VAE returns [C, 1, 1, H, W] — reshape to [1, C, 1, H, W]
-            if latent_image.dim() == 5 and latent_image.shape[0] != 1 and latent_image.shape[1] == 1:
-                latent_image = latent_image.permute(1, 0, 2, 3, 4)  # [1, C, 1, H, W]
-            elif latent_image.dim() == 4:
-                latent_image = latent_image.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
-            latent_image = latent_image.to(torch.float32)
+            latent_image = _encode_ref_image(img, height, width, device, dtype)
             print(f"[DaVinci] Encoded ref image: {latent_image.shape}")
-        elif ref_image is not None:
-            print("[DaVinci] WARNING: ref_image provided but no VAE connected. Ignoring ref_image.")
 
         # Get text embedding info
         embeds = text_embeds["embeds"]
