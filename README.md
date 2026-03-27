@@ -1,3 +1,7 @@
+OBS! This is still work in progress, do not expect it to work 100%. 
+Im going away on easter holiday and have no time to look at it before im back.
+Feel free to fork it and continue the work, or wait for Kijai to release his version.
+
 # ComfyUI-DaVinci-MagiHuman
 
 ComfyUI custom nodes for [daVinci-MagiHuman](https://huggingface.co/GAIR/daVinci-MagiHuman), a 15B parameter single-stream transformer for fast audio-video generation. Optimized for consumer GPUs (RTX 5090 32GB).
