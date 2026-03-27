@@ -317,6 +317,7 @@ class DaVinciSampler:
                                                "tooltip": "Move model to CPU after sampling to free VRAM."}),
             },
             "optional": {
+                "turbo_vae": ("DAVINCI_VAE", {"tooltip": "Connect TurboVAE for real-time decoded preview during sampling."}),
                 "ref_image": ("IMAGE", {"tooltip": "Optional reference image for image-to-video generation. Leave disconnected for text-to-video."}),
                 "samples": ("LATENT", {"tooltip": "Optional initial latents for video-to-video. Leave disconnected for normal generation."}),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -330,7 +331,7 @@ class DaVinciSampler:
 
     def sample(
         self, model, text_embeds, width, height, num_frames, steps, shift, seed,
-        force_offload=True, ref_image=None, samples=None, denoise_strength=1.0,
+        force_offload=True, turbo_vae=None, ref_image=None, samples=None, denoise_strength=1.0,
     ):
         dit = model["model"]
         swap_manager = model["swap_manager"]
@@ -348,18 +349,44 @@ class DaVinciSampler:
 
         pbar = ProgressBar(steps)
 
+        # Preview VAE: decode a single frame for real preview
+        preview_vae = turbo_vae["vae"] if turbo_vae is not None else None
+        preview_dtype = turbo_vae["dtype"] if turbo_vae is not None else torch.bfloat16
+
         def step_callback(idx, total, latent_video, latent_audio):
-            # Preview: take middle frame from latent volume
             preview_img = None
             try:
-                mid_t = latent_video.shape[2] // 2
-                frame = latent_video[0, :, mid_t].cpu().float()  # [48, H, W]
-                from .preview import latent_to_rgb
                 from PIL import Image
-                rgb = latent_to_rgb(frame)
-                rgb_uint8 = (rgb.clamp(0, 1) * 255).to(torch.uint8).numpy()
-                img = Image.fromarray(rgb_uint8)
-                preview_img = ("JPEG", img, 256)
+                if preview_vae is not None:
+                    # Decode middle frame with TurboVAE for real preview
+                    mid_t = latent_video.shape[2] // 2
+                    # Take 1 frame: [1, 48, 1, H, W]
+                    frame_latent = latent_video[:, :, mid_t:mid_t+1].to(dtype=preview_dtype, device=device)
+                    preview_vae.to(device)
+                    with torch.no_grad():
+                        frame_decoded = preview_vae.decode(frame_latent, output_offload=False).float()
+                    preview_vae.to(offload_device)
+                    # [-1,1] -> [0,1] -> uint8
+                    frame_decoded = frame_decoded[0, :, 0]  # [3, H, W]
+                    frame_decoded = frame_decoded.mul(0.5).add(0.5).clamp(0, 1)
+                    frame_decoded = frame_decoded.permute(1, 2, 0)  # [H, W, 3]
+                    rgb_uint8 = (frame_decoded * 255).to(torch.uint8).cpu().numpy()
+                    img = Image.fromarray(rgb_uint8)
+                    # Resize for preview
+                    w, h = img.size
+                    if max(w, h) > 256:
+                        scale = 256 / max(w, h)
+                        img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+                    preview_img = ("JPEG", img, 256)
+                else:
+                    # Fallback: crude latent channel averaging
+                    from .preview import latent_to_rgb
+                    mid_t = latent_video.shape[2] // 2
+                    frame = latent_video[0, :, mid_t].cpu().float()
+                    rgb = latent_to_rgb(frame)
+                    rgb_uint8 = (rgb.clamp(0, 1) * 255).to(torch.uint8).numpy()
+                    img = Image.fromarray(rgb_uint8)
+                    preview_img = ("JPEG", img, 256)
             except Exception:
                 pass
             pbar.update_absolute(idx + 1, total, preview_img)
