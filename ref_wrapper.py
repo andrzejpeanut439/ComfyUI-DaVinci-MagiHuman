@@ -43,6 +43,9 @@ def load_ref_model(model_dir: str, dtype: torch.dtype = torch.bfloat16) -> DiTMo
         index = json.load(f)
 
     model_config = ModelConfig()
+    # Computed fields that are normally set by MagiPipelineConfig.post_override_config
+    model_config.num_heads_q = model_config.hidden_size // model_config.head_dim
+    model_config.num_heads_kv = model_config.num_query_groups
     model = DiTModel(model_config)
 
     shard_to_keys = {}
