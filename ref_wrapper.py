@@ -74,6 +74,15 @@ def load_ref_model(model_dir: str, dtype: torch.dtype = torch.bfloat16) -> DiTMo
             print(f"    unexpected: {k}")
 
     model = model.to(dtype).eval()
+
+    # Reference keeps adapter and output heads in float32 (not bf16)
+    # Adapter has RoPE sin/cos that needs float32 precision
+    model.adapter.to(torch.float32)
+    model.final_norm_video.to(torch.float32)
+    model.final_norm_audio.to(torch.float32)
+    model.final_linear_video.to(torch.float32)
+    model.final_linear_audio.to(torch.float32)
+
     return model
 
 
@@ -186,8 +195,8 @@ def run_distill_sampling(
     # Schedulers (separate for video and audio, matching reference)
     video_scheduler = FlowUniPCMultistepScheduler()
     audio_scheduler = FlowUniPCMultistepScheduler()
-    video_scheduler.set_timesteps(steps, device="cpu", shift=shift)
-    audio_scheduler.set_timesteps(steps, device="cpu", shift=shift)
+    video_scheduler.set_timesteps(steps, device=device, shift=shift)
+    audio_scheduler.set_timesteps(steps, device=device, shift=shift)
     timesteps = video_scheduler.timesteps
 
     # Move latent_image to device if provided
@@ -201,12 +210,12 @@ def run_distill_sampling(
         if latent_image is not None:
             latent_video[:, :, :1] = latent_image[:, :, :1]
 
-        # Build EvalInput (full latent volumes)
+        # Build EvalInput (full latent volumes) — text stays float32 (reference keeps it float32)
         eval_input = EvalInput(
             x_t=latent_video,
             audio_x_t=latent_audio,
             audio_feat_len=[latent_audio.shape[1]],
-            txt_feat=text_embeds.to(device=device, dtype=dtype),
+            txt_feat=text_embeds.to(device=device, dtype=torch.float32),
             txt_feat_len=[text_len],
         )
 
@@ -215,14 +224,13 @@ def run_distill_sampling(
             packed = data_proxy.process_input(eval_input)
             x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler = packed
 
-            # Everything in bf16 to match model weights
-            x = x.to(device=device, dtype=dtype)
+            x = x.to(device=device)
             coords_mapping = coords_mapping.to(device=device)
 
             # --- Model forward with block swapping ---
             swap_manager._evict_all()
 
-            # Adapter: input embedding + RoPE
+            # Adapter (runs in float32 — matching reference)
             from inference.model.dit.dit_module import ModalityDispatcher
             modality_dispatcher = ModalityDispatcher(modality_mapping, 3)
             permute_mapping = modality_dispatcher.permute_mapping
@@ -232,6 +240,7 @@ def run_distill_sampling(
             text_mask = modality_mapping == Modality.TEXT
 
             x, rope = model.adapter(x, coords_mapping, video_mask, audio_mask, text_mask)
+            # Cast to bf16 for transformer blocks (blocks use _BF16ComputeLinear internally)
             x = x.to(dtype)
             x = ModalityDispatcher.permute(x, permute_mapping)
 
@@ -258,29 +267,25 @@ def run_distill_sampling(
                 if evict >= 0:
                     swap_manager._move_to_cpu(evict)
 
-            # Unpermute and output heads (cast to float32 matching reference post_process_dtype)
+            # Unpermute and output heads (float32 — adapter/output heads kept in float32)
             x = ModalityDispatcher.inv_permute(x, inv_permute_mapping)
 
             x_video = x[video_mask].float()
             x_video = model.final_norm_video(x_video)
-            x_video = model.final_linear_video.float()(x_video)
+            x_video = model.final_linear_video(x_video)
 
             x_audio = x[audio_mask].float()
             x_audio = model.final_norm_audio(x_audio)
-            x_audio = model.final_linear_audio.float()(x_audio)
+            x_audio = model.final_linear_audio(x_audio)
 
-            # Combine into output tensor for data_proxy.process_output
+            # Combine into output tensor (bf16 matching reference x.dtype)
             x_out = torch.zeros(
                 x.shape[0],
                 max(model.config.video_in_channels, model.config.audio_in_channels),
-                device=x.device, dtype=torch.float32,
+                device=x.device, dtype=x.dtype,
             )
-            x_out[video_mask, :model.config.video_in_channels] = x_video
-            x_out[audio_mask, :model.config.audio_in_channels] = x_audio
-
-            # Restore linear layers back to original dtype
-            model.final_linear_video.to(dtype)
-            model.final_linear_audio.to(dtype)
+            x_out[video_mask, :model.config.video_in_channels] = x_video.to(x.dtype)
+            x_out[audio_mask, :model.config.audio_in_channels] = x_audio.to(x.dtype)
 
             # Unpack velocity back to latent volumes
             v_video, v_audio = data_proxy.process_output(x_out)
@@ -400,11 +405,11 @@ def run_sr_sampling(
     if latent_image is not None:
         latent_image = latent_image.to(device=device, dtype=torch.float32)
 
-    # Schedulers
+    # Schedulers (on device, matching reference)
     video_scheduler = FlowUniPCMultistepScheduler()
     audio_scheduler = FlowUniPCMultistepScheduler()
-    video_scheduler.set_timesteps(sr_steps, device="cpu", shift=shift)
-    audio_scheduler.set_timesteps(sr_steps, device="cpu", shift=shift)
+    video_scheduler.set_timesteps(sr_steps, device=device, shift=shift)
+    audio_scheduler.set_timesteps(sr_steps, device=device, shift=shift)
     timesteps = video_scheduler.timesteps
 
     # SR denoising loop
@@ -417,7 +422,7 @@ def run_sr_sampling(
             x_t=latent_video,
             audio_x_t=latent_audio_sr,
             audio_feat_len=[latent_audio_sr.shape[1]],
-            txt_feat=text_embeds.to(device=device, dtype=dtype),
+            txt_feat=text_embeds.to(device=device, dtype=torch.float32),
             txt_feat_len=[text_len],
         )
 
@@ -425,7 +430,7 @@ def run_sr_sampling(
             packed = sr_data_proxy.process_input(eval_input)
             x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler = packed
 
-            x = x.to(device=device, dtype=dtype)
+            x = x.to(device=device)
             coords_mapping = coords_mapping.to(device=device)
 
             swap_manager._evict_all()
@@ -438,8 +443,9 @@ def run_sr_sampling(
             audio_mask = modality_mapping == Modality.AUDIO
             text_mask = modality_mapping == Modality.TEXT
 
+            # Adapter runs in float32
             x, rope = sr_model.adapter(x, coords_mapping, video_mask, audio_mask, text_mask)
-            x = x.to(dtype)
+            x = x.to(dtype)  # cast to bf16 for transformer blocks
             x = ModalityDispatcher.permute(x, permute_mapping)
 
             cp_split_sizes = [x.shape[0]]
@@ -465,24 +471,22 @@ def run_sr_sampling(
 
             x = ModalityDispatcher.inv_permute(x, inv_permute_mapping)
 
+            # Output heads in float32 (kept in float32 by load_ref_model)
             x_video = x[video_mask].float()
             x_video = sr_model.final_norm_video(x_video)
-            x_video = sr_model.final_linear_video.float()(x_video)
+            x_video = sr_model.final_linear_video(x_video)
 
             x_audio = x[audio_mask].float()
             x_audio = sr_model.final_norm_audio(x_audio)
-            x_audio = sr_model.final_linear_audio.float()(x_audio)
-
-            sr_model.final_linear_video.to(dtype)
-            sr_model.final_linear_audio.to(dtype)
+            x_audio = sr_model.final_linear_audio(x_audio)
 
             x_out = torch.zeros(
                 x.shape[0],
                 max(sr_model.config.video_in_channels, sr_model.config.audio_in_channels),
-                device=x.device, dtype=torch.float32,
+                device=x.device, dtype=x.dtype,
             )
-            x_out[video_mask, :sr_model.config.video_in_channels] = x_video
-            x_out[audio_mask, :sr_model.config.audio_in_channels] = x_audio
+            x_out[video_mask, :sr_model.config.video_in_channels] = x_video.to(x.dtype)
+            x_out[audio_mask, :sr_model.config.audio_in_channels] = x_audio.to(x.dtype)
 
             v_video, v_audio = sr_data_proxy.process_output(x_out)
 
