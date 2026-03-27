@@ -371,7 +371,6 @@ class DaVinciSampler:
                                                "tooltip": "Move model to CPU after sampling to free VRAM."}),
             },
             "optional": {
-                "turbo_vae": ("DAVINCI_VAE", {"tooltip": "Connect TurboVAE for real-time decoded preview during sampling."}),
                 "ref_image": ("IMAGE", {"tooltip": "Reference image for I2V (must be resized to width x height before connecting)."}),
             }
         }
@@ -383,7 +382,7 @@ class DaVinciSampler:
 
     def sample(
         self, model, text_embeds, width, height, num_frames, steps, shift, seed,
-        force_offload=True, turbo_vae=None, ref_image=None,
+        force_offload=True, ref_image=None,
     ):
         dit = model["model"]
         swap_manager = model["swap_manager"]
@@ -415,33 +414,8 @@ class DaVinciSampler:
 
         pbar = ProgressBar(steps)
 
-        # Preview VAE: decode a single frame for real preview
-        preview_vae = turbo_vae["vae"] if turbo_vae is not None else None
-        preview_dtype = turbo_vae["dtype"] if turbo_vae is not None else torch.bfloat16
-
         def step_callback(idx, total, latent_video, latent_audio):
-            preview_img = None
-            if preview_vae is not None:
-                try:
-                    from PIL import Image
-                    mid_t = latent_video.shape[2] // 2
-                    frame_latent = latent_video[:, :, mid_t:mid_t+1].to(dtype=preview_dtype, device=device)
-                    preview_vae.to(device)
-                    with torch.no_grad():
-                        frame_decoded = preview_vae.decode(frame_latent, output_offload=False).float()
-                    preview_vae.to(offload_device)
-                    frame_decoded = frame_decoded[0, :, 0].mul(0.5).add(0.5).clamp(0, 1)
-                    frame_decoded = frame_decoded.permute(1, 2, 0)
-                    rgb_uint8 = (frame_decoded * 255).to(torch.uint8).cpu().numpy()
-                    img = Image.fromarray(rgb_uint8)
-                    w, h = img.size
-                    if max(w, h) > 256:
-                        scale = 256 / max(w, h)
-                        img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
-                    preview_img = ("JPEG", img, 256)
-                except Exception as e:
-                    print(f"[DaVinci] Preview error: {e}")
-            pbar.update_absolute(idx + 1, total, preview_img)
+            pbar.update_absolute(idx + 1, total)
 
         # Run the reference distill sampling loop
         result = run_distill_sampling(
