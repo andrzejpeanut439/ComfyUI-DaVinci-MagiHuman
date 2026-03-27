@@ -200,12 +200,14 @@ def run_distill_sampling(
             txt_feat_len=[text_len],
         )
 
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
+        with torch.no_grad():
             # Pack tokens via data proxy
             packed = data_proxy.process_input(eval_input)
-            # packed is tuple: (x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler)
-
             x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler = packed
+
+            # Everything in bf16 to match model weights
+            x = x.to(device=device, dtype=dtype)
+            coords_mapping = coords_mapping.to(device=device)
 
             # --- Model forward with block swapping ---
             swap_manager._evict_all()
@@ -219,9 +221,6 @@ def run_distill_sampling(
             audio_mask = modality_mapping == Modality.AUDIO
             text_mask = modality_mapping == Modality.TEXT
 
-            # Adapter expects float32 input (creates output_x in float32 internally)
-            x = x.float()
-            coords_mapping = coords_mapping.float()
             x, rope = model.adapter(x, coords_mapping, video_mask, audio_mask, text_mask)
             x = x.to(dtype)
             x = ModalityDispatcher.permute(x, permute_mapping)
@@ -248,11 +247,11 @@ def run_distill_sampling(
             # Unpermute and output heads
             x = ModalityDispatcher.inv_permute(x, inv_permute_mapping)
 
-            x_video = x[video_mask].to(model.final_norm_video.weight.dtype)
+            x_video = x[video_mask].float()
             x_video = model.final_norm_video(x_video)
             x_video = model.final_linear_video(x_video)
 
-            x_audio = x[audio_mask].to(model.final_norm_audio.weight.dtype)
+            x_audio = x[audio_mask].float()
             x_audio = model.final_norm_audio(x_audio)
             x_audio = model.final_linear_audio(x_audio)
 
@@ -260,7 +259,7 @@ def run_distill_sampling(
             x_out = torch.zeros(
                 x.shape[0],
                 max(model.config.video_in_channels, model.config.audio_in_channels),
-                device=x.device, dtype=x.dtype
+                device=x.device, dtype=torch.float32,
             )
             x_out[video_mask, :model.config.video_in_channels] = x_video
             x_out[audio_mask, :model.config.audio_in_channels] = x_audio
