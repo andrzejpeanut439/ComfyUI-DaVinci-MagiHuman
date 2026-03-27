@@ -361,7 +361,7 @@ class DaVinciSampler:
                                    "tooltip": "256p base: 448. Only used for base/distill generation."}),
                 "height": ("INT", {"default": 256, "min": 64, "max": 1088, "step": 16,
                                     "tooltip": "256p base: 256. Only used for base/distill generation."}),
-                "num_frames": ("INT", {"default": 125, "min": 5, "max": 250, "step": 1,
+                "num_frames": ("INT", {"default": 126, "min": 5, "max": 250, "step": 1,
                                         "tooltip": "Number of video frames. 125 = 5 seconds at 25fps."}),
                 "steps": ("INT", {"default": 8, "min": 1, "max": 50, "step": 1,
                                    "tooltip": "Distill: 8 steps. Base: 32 steps."}),
