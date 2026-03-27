@@ -69,10 +69,7 @@ def _encode_ref_image(img, height, width, device_target, dtype):
     """
     vae = _get_wan22_vae(device_target, dtype)
     # Move entire VAE including scale tensors to device
-    vae.vae.to(device_target)
-    vae.mean = vae.mean.to(device_target)
-    vae.inv_std = vae.inv_std.to(device_target)
-    vae.scale = [vae.mean, vae.inv_std]
+    vae.to(device_target)
 
     # Convert [1, H, W, 3] 0-1 -> [1, 3, 1, H, W] -1..1
     x = img.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -83,10 +80,7 @@ def _encode_ref_image(img, height, width, device_target, dtype):
     with torch.no_grad():
         latent = vae.encode(x)  # [1, 48, 1, latH, latW]
 
-    vae.vae.to("cpu")
-    vae.mean = vae.mean.to("cpu")
-    vae.inv_std = vae.inv_std.to("cpu")
-    vae.scale = [vae.mean, vae.inv_std]
+    vae.to("cpu")
     torch.cuda.empty_cache()
 
     return latent.to(torch.float32)
