@@ -215,9 +215,9 @@ def run_distill_sampling(
             modality_dispatcher = ModalityDispatcher(modality_mapping, 3)
             permute_mapping = modality_dispatcher.permute_mapping
             inv_permute_mapping = modality_dispatcher.inv_permute_mapping
-            video_mask = modality_mapping == M.VIDEO
-            audio_mask = modality_mapping == M.AUDIO
-            text_mask = modality_mapping == M.TEXT
+            video_mask = modality_mapping == Modality.VIDEO
+            audio_mask = modality_mapping == Modality.AUDIO
+            text_mask = modality_mapping == Modality.TEXT
 
             x, rope = model.adapter(x, coords_mapping, video_mask, audio_mask, text_mask)
             x = x.to(dtype)
