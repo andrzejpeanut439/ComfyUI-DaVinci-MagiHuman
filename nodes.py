@@ -17,7 +17,12 @@ from .ref_wrapper import (
     load_ref_model, RefBlockSwapManager, create_data_proxy,
     run_distill_sampling, EvalInput,
 )
-from .turbo_vae import TurboVAEDecoder, load_turbo_vae
+# Use reference TurboVAE implementation
+import sys as _sys
+_ref_path = os.path.join(os.path.dirname(__file__), "davinci_ref")
+if _ref_path not in _sys.path:
+    _sys.path.insert(0, _ref_path)
+from inference.model.turbo_vaed.turbo_vaed_model import get_turbo_vaed
 from .preview import send_preview
 
 # Register model paths
@@ -132,8 +137,20 @@ class DaVinciTurboVAELoader:
         if not os.path.isdir(vae_dir):
             raise FileNotFoundError(f"TurboVAE directory not found: {vae_dir}")
 
-        print(f"[DaVinci] Loading TurboVAE from {vae_dir}...")
-        vae = load_turbo_vae(vae_dir, dtype=torch_dtype, device="cpu")
+        # Find config json and checkpoint in turbo_vae dir
+        config_path = None
+        ckpt_path = None
+        for f in os.listdir(vae_dir):
+            if f.endswith('.json') and 'index' not in f:
+                config_path = os.path.join(vae_dir, f)
+            if f.endswith('.ckpt'):
+                ckpt_path = os.path.join(vae_dir, f)
+
+        if config_path is None or ckpt_path is None:
+            raise FileNotFoundError(f"TurboVAE config or checkpoint not found in {vae_dir}")
+
+        print(f"[DaVinci] Loading TurboVAE from {vae_dir} (reference code)...")
+        vae = get_turbo_vaed(config_path, ckpt_path, device="cpu", weight_dtype=torch_dtype)
         print(f"[DaVinci] TurboVAE loaded.")
 
         return ({"vae": vae, "dtype": torch_dtype},)
@@ -550,8 +567,9 @@ class DaVinciDecode:
 
         pbar = ProgressBar(1)
 
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
-            video = vae(video_latent.to(device), output_offload=output_offload)
+        with torch.no_grad():
+            # Reference TurboVAED.decode handles normalization internally
+            video = vae.decode(video_latent.to(device), output_offload=output_offload).float()
 
         pbar.update(1)
 
@@ -561,10 +579,9 @@ class DaVinciDecode:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # Convert to ComfyUI image format: [B, H, W, C] float32 0-1
-        # video is [B, 3, T, H, W]
-        video = video.float().cpu()
-        video = video.clamp(-1, 1) * 0.5 + 0.5  # Normalize to 0-1
+        # Reference output is [-1, 1], convert to [0, 1] (matching reference post_process)
+        video = video.cpu()
+        video.mul_(0.5).add_(0.5).clamp_(0, 1)
 
         # [B, 3, T, H, W] -> [T, H, W, 3]
         video = video[0].permute(1, 2, 3, 0).contiguous()
