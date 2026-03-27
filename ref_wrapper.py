@@ -211,7 +211,7 @@ def run_distill_sampling(
             swap_manager._evict_all()
 
             # Adapter: input embedding + RoPE
-            from inference.common.sequence_schema import Modality as M, ModalityDispatcher, VarlenHandler as VH
+            from inference.model.dit.dit_module import ModalityDispatcher
             modality_dispatcher = ModalityDispatcher(modality_mapping, 3)
             permute_mapping = modality_dispatcher.permute_mapping
             inv_permute_mapping = modality_dispatcher.inv_permute_mapping
