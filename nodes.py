@@ -13,11 +13,11 @@ import folder_paths
 import comfy.model_management as mm
 from comfy.utils import ProgressBar
 
-from .model_dit import DiTModel, load_dit_from_sharded, _rms_norm
+from .ref_wrapper import (
+    load_ref_model, RefBlockSwapManager, create_data_proxy,
+    run_distill_sampling, EvalInput,
+)
 from .turbo_vae import TurboVAEDecoder, load_turbo_vae
-from .scheduler import FlowMatchingScheduler
-from .data_proxy import MagiDataProxy
-from .block_swap import BlockSwapManager
 from .preview import send_preview
 
 # Register model paths
@@ -82,11 +82,11 @@ class DaVinciModelLoader:
 
         pbar = ProgressBar(len(shard_files) + 1)
 
-        model = load_dit_from_sharded(model_dir, dtype=torch_dtype, device="cpu")
+        model = load_ref_model(model_dir, dtype=torch_dtype)
         pbar.update(len(shard_files))
 
-        # Set up block swap manager
-        swap_manager = BlockSwapManager(
+        # Set up block swap manager (reference model: model.block.layers)
+        swap_manager = RefBlockSwapManager(
             model=model,
             blocks_on_gpu=blocks_on_gpu,
             device=device,
@@ -95,7 +95,7 @@ class DaVinciModelLoader:
         swap_manager.setup()
         pbar.update(1)
 
-        print(f"[DaVinci] Model loaded. {blocks_on_gpu} blocks on GPU, {40 - blocks_on_gpu} on CPU.")
+        print(f"[DaVinci] Ref model loaded. {blocks_on_gpu}/{swap_manager.num_layers} blocks on GPU.")
 
         model_data = {
             "model": model,
@@ -318,115 +318,52 @@ class DaVinciSampler:
         dit = model["model"]
         swap_manager = model["swap_manager"]
         dtype = model["dtype"]
-        is_distill = model["is_distill"]
 
-        torch.manual_seed(seed)
-        generator = torch.Generator(device="cpu").manual_seed(seed)
+        # Get text embedding info
+        embeds = text_embeds["embeds"]
+        # Compute actual text length (non-zero tokens)
+        text_len = (embeds.abs().sum(-1) > 0).sum(-1).item()
+        if text_len == 0:
+            text_len = 1
 
-        # Data proxy for token packing
-        proxy = MagiDataProxy()
+        # Create data proxy using reference code
+        data_proxy = create_data_proxy()
 
-        # Compute latent dimensions
-        _, _, latent_t, latent_h, latent_w = proxy.get_latent_shape(height, width, num_frames)
+        pbar = ProgressBar(steps)
 
-        print(f"[DaVinci] Generating: {width}x{height}, {num_frames} frames, "
-              f"latent: {latent_t}x{latent_h}x{latent_w}, steps: {steps}")
+        def step_callback(idx, total, latent_video, latent_audio):
+            # Preview: take middle frame from latent volume
+            preview_img = None
+            try:
+                mid_t = latent_video.shape[2] // 2
+                frame = latent_video[0, :, mid_t].cpu().float()  # [48, H, W]
+                from .preview import latent_to_rgb
+                from PIL import Image
+                rgb = latent_to_rgb(frame)
+                rgb_uint8 = (rgb.clamp(0, 1) * 255).to(torch.uint8).numpy()
+                img = Image.fromarray(rgb_uint8)
+                preview_img = ("JPEG", img, 256)
+            except Exception:
+                pass
+            pbar.update_absolute(idx + 1, total, preview_img)
 
-        # Initialize video latent
-        if samples is not None:
-            video_latent = samples["samples"].to(dtype=dtype, device="cpu")
-        else:
-            video_latent = torch.randn(
-                1, proxy.z_dim, latent_t, latent_h, latent_w,
-                dtype=dtype, generator=generator,
-            )
-
-        # Patchify video
-        video_tokens, video_coords = proxy.patchify_video(video_latent.to(device))
-
-        # Audio tokens
-        audio_tokens, audio_coords = proxy.prepare_audio_tokens(num_frames, device, dtype)
-
-        # Text tokens
-        text_tokens = text_embeds["embeds"].to(device=device, dtype=dtype)
-        text_coords = proxy.prepare_text_coords(text_tokens)
-
-        # Build packed sequence
-        seq_data = proxy.build_sequence(
-            video_tokens, video_coords,
-            audio_tokens, audio_coords,
-            text_tokens, text_coords,
+        # Run the reference distill sampling loop
+        result = run_distill_sampling(
+            model=dit,
+            swap_manager=swap_manager,
+            data_proxy=data_proxy,
+            text_embeds=embeds,
+            text_len=text_len,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            steps=steps,
+            shift=shift,
+            seed=seed,
+            device=device,
+            dtype=dtype,
+            callback=step_callback,
         )
-
-        # Scheduler (matches reference FlowUniPCMultistepScheduler)
-        scheduler = FlowMatchingScheduler(shift=shift)
-        scheduler.set_timesteps(steps)
-
-        # Keep video and audio tokens separate (different channel dims: 192 vs 64)
-        sv = seq_data["video_shape"][0]
-        sa = seq_data["audio_shape"][0]
-        x_video = video_tokens  # [B, sv, 192]
-        x_audio = seq_data["audio_tokens"]  # [B, sa, 64]
-        x_text = seq_data["text_tokens"]  # [B, st, 3584] - fixed, not denoised
-
-        # Handle partial denoising
-        if denoise_strength < 1.0:
-            start_step = int((1.0 - denoise_strength) * steps)
-            sigma_start = scheduler.sigmas[start_step].item()
-            noise_v = torch.randn_like(x_video)
-            x_video = scheduler.add_noise(x_video, noise_v, sigma_start)
-            noise_a = torch.randn_like(x_audio)
-            x_audio = scheduler.add_noise(x_audio, noise_a, sigma_start)
-        else:
-            start_step = 0
-
-        # Precompute coords (constant across steps)
-        coords = torch.cat([
-            seq_data["video_coords"],
-            seq_data["audio_coords"],
-            seq_data["text_coords"],
-        ], dim=1)
-
-        pbar = ProgressBar(steps - start_step)
-
-        # Denoising loop
-        for i in range(start_step, steps):
-            with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
-                rope_cos, rope_sin = dit.rope(coords)
-
-                # Embed each modality to hidden_size (5120) then concatenate
-                v_emb = dit.video_embedder(x_video)
-                a_emb = dit.audio_embedder(x_audio)
-                t_emb = dit.text_embedder(x_text)
-                h = torch.cat([v_emb, a_emb, t_emb], dim=1)  # [B, S, 5120]
-
-                # Run through transformer with block swapping
-                h = swap_manager.forward_with_swap(
-                    h, rope_cos, rope_sin,
-                    seq_data["modality_ids"],
-                )
-
-                # Extract velocity predictions (project back to modality dims)
-                video_vel = dit.final_linear_video(_rms_norm(h[:, :sv], dit.final_norm_video))
-                audio_vel = dit.final_linear_audio(_rms_norm(h[:, sv:sv + sa], dit.final_norm_audio))
-
-            # DDIM step: x0 = x_t - sigma*v, then re-noise to next sigma
-            x_video = scheduler.step_ddim(video_vel, i, x_video)
-            x_audio = scheduler.step_ddim(audio_vel, i, x_audio)
-
-            # Live preview
-            preview_img = send_preview(
-                x_video, proxy, latent_t, latent_h, latent_w,
-                step=i - start_step, total_steps=steps - start_step,
-            )
-            pbar.update_absolute(i - start_step + 1, steps - start_step, preview_img)
-
-        # Extract final tokens
-        final_video_tokens = x_video.cpu()
-        final_audio_tokens = x_audio.cpu()
-
-        # Unpatchify back to latent volume
-        video_latent = proxy.unpatchify_video(final_video_tokens, latent_t, latent_h, latent_w)
 
         if force_offload:
             swap_manager.cleanup()
@@ -434,15 +371,7 @@ class DaVinciSampler:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        print(f"[DaVinci] Sampling complete. Latent shape: {video_latent.shape}")
-
-        return ({
-            "video_latent": video_latent,
-            "audio_tokens": final_audio_tokens,
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
-        },)
+        return (result,)
 
 
 class DaVinciSuperResolution:
