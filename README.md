@@ -1,4 +1,7 @@
-OBS! This is still work in progress, do not expect it to work. 
+Edit: This repo has been archived as i have not been able to generate good (enough) results with the model, i'll stick to LTX2.3 for now. 
+Feel free to keep working on it.
+
+Edit: OBS! This is still work in progress, do not expect it to work. 
 Im going away on easter holiday and have no time to look at it before im back.
 Feel free to fork it and continue the work, or wait for Kijai to release his version.
 
